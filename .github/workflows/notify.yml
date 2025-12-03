@@ -1,0 +1,72 @@
+# Notifications - Reusable workflow
+name: Notify
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+      DISCORD_WEBHOOK_URL:
+        required: false
+
+jobs:
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment ${{ inputs.status }}*\nEnvironment: ${{ inputs.environment }}\nVersion: ${{ inputs.version }}\nRepo: ${{ github.repository }}"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {"type": "mrkdwn", "text": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"}
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Discord
+        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        run: |
+          COLOR=0
+          case "${{ inputs.status }}" in
+            success)   COLOR=3066993 ;;
+            failure)   COLOR=15158332 ;;
+          esac
+          curl -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "Deployment ${{ inputs.status }}",
+                "color": '"$COLOR"',
+                "fields": [
+                  {"name": "Environment", "value": "${{ inputs.environment }}", "inline": true},
+                  {"name": "Version", "value": "${{ inputs.version }}", "inline": true}
+                ]
+              }]
+            }'

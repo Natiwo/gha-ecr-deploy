@@ -1,0 +1,320 @@
+# CD Pipeline - Deploy to ECR
+# Reuses CI artifacts, no rebuild
+name: CD
+
+on:
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+    branches: [main]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+concurrency:
+  group: cd-${{ github.ref }}-${{ github.event.inputs.environment || 'production' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1  # Change to your region
+  ECR_REPOSITORY: your-org/your-repo  # Change to your ECR repo
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    if: |
+      github.event.workflow_run.conclusion == 'success' ||
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.tag }}
+      environment: ${{ steps.env.outputs.name }}
+      should_deploy: ${{ steps.check.outputs.deploy }}
+      run_id: ${{ steps.artifacts.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "name=production" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "name=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            echo "tag=${SHORT_SHA}-$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Find CI artifacts
+        id: artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            RUN_ID="${{ github.event.workflow_run.id }}"
+          else
+            RUN_ID=$(gh run list --workflow=ci.yml --branch=main --status=success --limit=1 --json databaseId -q '.[0].databaseId')
+          fi
+          if [[ -z "$RUN_ID" ]]; then
+            echo "No successful CI run found"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Validate artifacts
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARTIFACTS=$(gh api repos/${{ github.repository }}/actions/runs/${{ steps.artifacts.outputs.run_id }}/artifacts --jq '.artifacts[].name' | grep -c "docker-image" || echo "0")
+          if [[ "$ARTIFACTS" -lt 2 ]]; then
+            echo "Expected 2 artifacts, found $ARTIFACTS"
+            echo "deploy=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "deploy=true" >> $GITHUB_OUTPUT
+
+  deploy-staging:
+    name: Deploy Staging
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: |
+      needs.prepare.outputs.should_deploy == 'true' &&
+      needs.prepare.outputs.environment == 'staging'
+    environment:
+      name: staging
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [minimal, runtime]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ matrix.target }}
+          path: /tmp
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.prepare.outputs.run_id }}
+
+      - name: Load image
+        run: |
+          gunzip -c /tmp/image-${{ matrix.target }}.tar.gz | docker load
+          docker tag ci-test-${{ matrix.target }}:latest staging-${{ matrix.target }}:latest
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push to ECR
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          docker tag staging-${{ matrix.target }}:latest $IMAGE:$VERSION-${{ matrix.target }}
+          docker tag staging-${{ matrix.target }}:latest $IMAGE:staging-${{ matrix.target }}
+          docker push $IMAGE:$VERSION-${{ matrix.target }}
+          docker push $IMAGE:staging-${{ matrix.target }}
+
+      - name: Smoke test
+        run: |
+          docker run --rm staging-${{ matrix.target }}:latest bash -c '
+            set -e
+            # Add your smoke tests here
+            echo "Smoke test passed"
+          '
+
+  deploy-production:
+    name: Deploy Production
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: |
+      needs.prepare.outputs.should_deploy == 'true' &&
+      needs.prepare.outputs.environment == 'production'
+    environment:
+      name: production
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [minimal, runtime]
+    outputs:
+      previous-tag: ${{ steps.backup.outputs.previous }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Backup current latest
+        id: backup
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}"
+          PREVIOUS=$(aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-ids imageTag=latest-${{ matrix.target }} \
+            --query 'imageDetails[0].imageDigest' \
+            --output text 2>/dev/null || echo "none")
+          echo "previous=$PREVIOUS" >> $GITHUB_OUTPUT
+
+      - name: Download CI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ matrix.target }}
+          path: /tmp
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.prepare.outputs.run_id }}
+
+      - name: Push to ECR
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          gunzip -c /tmp/image-${{ matrix.target }}.tar.gz | docker load
+          docker tag ci-test-${{ matrix.target }}:latest $IMAGE:$VERSION-${{ matrix.target }}
+          docker tag ci-test-${{ matrix.target }}:latest $IMAGE:latest-${{ matrix.target }}
+          docker push $IMAGE:$VERSION-${{ matrix.target }}
+          docker push $IMAGE:latest-${{ matrix.target }}
+
+      - name: Smoke test
+        run: |
+          docker run --rm ci-test-${{ matrix.target }}:latest bash -c '
+            set -e
+            # Add your smoke tests here
+            echo "Smoke test passed"
+          '
+
+  rollback:
+    name: Rollback
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-production]
+    if: failure() && needs.prepare.outputs.environment == 'production'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Rollback
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}"
+          for TARGET in minimal runtime; do
+            PREVIOUS="${{ needs.deploy-production.outputs.previous-tag }}"
+            if [[ "$PREVIOUS" != "none" && -n "$PREVIOUS" ]]; then
+              docker pull $IMAGE@$PREVIOUS
+              docker tag $IMAGE@$PREVIOUS $IMAGE:latest-$TARGET
+              docker push $IMAGE:latest-$TARGET
+              echo "Rolled back $TARGET"
+            fi
+          done
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy-production]
+    if: success() && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always() && (needs.deploy-staging.result == 'success' || needs.deploy-production.result == 'success')
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete untagged images
+        run: |
+          UNTAGGED=$(aws ecr list-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --filter "tagStatus=UNTAGGED" \
+            --query 'imageIds[*]' \
+            --output json 2>/dev/null || echo "[]")
+          if [[ "$UNTAGGED" != "[]" && -n "$UNTAGGED" ]]; then
+            aws ecr batch-delete-image \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --image-ids "$UNTAGGED" || true
+          fi
+
+      - name: Keep last 10 versions
+        run: |
+          for TARGET in minimal runtime; do
+            OLD=$(aws ecr describe-images \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --query "sort_by(imageDetails[?contains(imageTags || \`[]\`, '-${TARGET}') && !contains(imageTags || \`[]\`, 'latest') && !contains(imageTags || \`[]\`, 'staging')], &imagePushedAt)[:-10].imageDigest" \
+              --output text 2>/dev/null || echo "")
+            for DIGEST in $OLD; do
+              aws ecr batch-delete-image \
+                --repository-name ${{ env.ECR_REPOSITORY }} \
+                --image-ids imageDigest=$DIGEST || true
+            done
+          done
