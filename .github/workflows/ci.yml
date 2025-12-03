@@ -15,7 +15,8 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: your-org/your-repo  # Change to your repo (lowercase)
+  # Note: Change this to your repository name (must be lowercase)
+  IMAGE_NAME: natiwo/gha-ecr-deploy
 
 jobs:
   quality:

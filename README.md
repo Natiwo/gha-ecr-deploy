@@ -1,5 +1,9 @@
 # gha-ecr-deploy
 
+[![CI](https://github.com/Natiwo/gha-ecr-deploy/actions/workflows/ci.yml/badge.svg)](https://github.com/Natiwo/gha-ecr-deploy/actions/workflows/ci.yml)
+[![Security](https://github.com/Natiwo/gha-ecr-deploy/actions/workflows/security.yml/badge.svg)](https://github.com/Natiwo/gha-ecr-deploy/actions/workflows/security.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Production-grade CI/CD pattern for GitHub Actions with AWS ECR.
 
 ## Overview
